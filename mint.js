@@ -61,9 +61,75 @@
     return "Transaction failed: " + msg.slice(0, 160);
   }
 
-  // ---------- provider state ----------
-  var provider = (typeof window !== "undefined" && window.ethereum) ? window.ethereum : null;
+  // ---------- provider discovery (EIP-6963 + legacy injection) ----------
+  // EIP-6963 wallets announce themselves via window events; window.ethereum
+  // stays as a fallback. The provider is resolved lazily at connect time —
+  // never just once at page load — so late injection still works.
+  var announcedProviders = []; // entries: { info: {uuid, name, rdns}, provider }
+
+  function handleAnnounce(event) {
+    var detail = event && event.detail;
+    if (!detail || !detail.provider || !detail.info || !detail.info.uuid) return;
+    var known = announcedProviders.some(function (p) { return p.info.uuid === detail.info.uuid; });
+    if (!known) announcedProviders.push(detail);
+  }
+
+  function solicitProviders() {
+    if (typeof window === "undefined" || typeof window.dispatchEvent !== "function") return;
+    try { window.dispatchEvent(new Event("eip6963:requestProvider")); } catch (e) { /* ignore */ }
+  }
+
+  // Pure selection logic (unit-testable): prefer MetaMask among announcers,
+  // else the first announcer; else the legacy injected provider, preferring
+  // MetaMask when several wallets share window.ethereum.
+  function selectProvider(announced, injected) {
+    var i;
+    announced = announced || [];
+    for (i = 0; i < announced.length; i++) {
+      var rdns = announced[i] && announced[i].info && announced[i].info.rdns;
+      if (typeof rdns === "string" && /metamask/i.test(rdns)) return announced[i].provider;
+    }
+    if (announced.length) return announced[0].provider;
+    if (injected) {
+      if (injected.providers && injected.providers.length) {
+        for (i = 0; i < injected.providers.length; i++) {
+          if (injected.providers[i] && injected.providers[i].isMetaMask) return injected.providers[i];
+        }
+        return injected.providers[0];
+      }
+      return injected;
+    }
+    return null;
+  }
+
+  function pickProvider() {
+    var injected = (typeof window !== "undefined") ? window.ethereum : undefined;
+    return selectProvider(announcedProviders, injected || null);
+  }
+
+  var provider = null;
   var account = null;
+
+  function onAccountsChanged(accs) {
+    account = (accs && accs[0]) || null;
+    $("wallet").textContent = account ? shortAddress(account) : "not connected";
+    $("wallet").style.color = account ? "#e8e4d8" : "";
+    $("connect-wrap").style.display = account ? "none" : "";
+    refresh();
+  }
+
+  // Resolve (and cache) the provider, wiring wallet events once.
+  function ensureProvider() {
+    if (!provider) {
+      provider = pickProvider();
+      if (provider && provider.on && !provider._sgWired) {
+        provider._sgWired = true;
+        provider.on("accountsChanged", onAccountsChanged);
+        provider.on("chainChanged", function () { window.location.reload(); });
+      }
+    }
+    return provider;
+  }
 
   function requireDeployed() {
     return cfg && /^0x[0-9a-fA-F]{40}$/.test(cfg.CONTRACT_ADDRESS) &&
@@ -71,7 +137,9 @@
   }
 
   async function rpc(method, params) {
-    return provider.request({ method: method, params: params });
+    var prov = ensureProvider();
+    if (!prov) throw new Error("no wallet provider");
+    return prov.request({ method: method, params: params });
   }
 
   async function ethCall(selector) {
@@ -87,6 +155,13 @@
       return;
     }
     $("contract").textContent = cfg.CONTRACT_ADDRESS;
+    if (!pickProvider()) {
+      // No wallet (yet): chain reads route through the wallet, so there is
+      // nothing to query — stay neutral instead of erroring.
+      setStatus("info", "Connect a wallet to see live sale state and mint.");
+      updateMintButton(false);
+      return;
+    }
     try {
       var results = await Promise.all([
         ethCall(cfg.SELECTORS.totalSupply),
@@ -127,8 +202,12 @@
 
   // ---------- wallet ----------
   async function connect() {
-    if (!provider) {
-      setStatus("err", "No Ethereum wallet found. Install MetaMask, Rabby, or another wallet, then reload.");
+    provider = null; // re-resolve fresh on every attempt (late injection safe)
+    solicitProviders();
+    try { await new Promise(function (res) { setTimeout(res, 300); }); } catch (e) { /* ignore */ }
+    var prov = ensureProvider();
+    if (!prov) {
+      setStatus("err", "No Ethereum wallet found. On mobile, open this page in your wallet app's built-in browser (e.g. MetaMask's browser). On desktop, install MetaMask or Rabby, then reload.");
       return;
     }
     try {
@@ -177,22 +256,18 @@
   if (typeof document !== "undefined") {
     $("connect").addEventListener("click", connect);
     $("mint").addEventListener("click", mint);
-    if (provider && provider.on) {
-      provider.on("accountsChanged", function (accs) {
-        account = (accs && accs[0]) || null;
-        $("wallet").textContent = account ? shortAddress(account) : "not connected";
-        $("connect-wrap").style.display = account ? "none" : "";
-        refresh();
-      });
-      provider.on("chainChanged", function () { window.location.reload(); });
+    if (typeof window !== "undefined" && typeof window.addEventListener === "function") {
+      window.addEventListener("eip6963:announceProvider", handleAnnounce);
     }
+    solicitProviders();
+    ensureProvider(); // wire wallet events now if a provider is already injected
     refresh();
   }
 
   // Export pure helpers for node unit tests.
   if (typeof module !== "undefined" && module.exports) {
     module.exports = { shortAddress: shortAddress, parseUint256: parseUint256,
-      weiEquals: weiEquals,
+      weiEquals: weiEquals, selectProvider: selectProvider,
       buildMintTx: buildMintTx, friendlyError: friendlyError };
   }
 })();
